@@ -1,0 +1,355 @@
+Table warehouse{
+  id int [primary key, increment]
+  name varchar
+  location varchar [not null]
+  capacity int [not null]
+  created_at date [not null]
+}
+
+Table products{
+  id int [primary key, increment]
+  sku varchar(12) [unique]
+  name varchar [not null]
+  price decimal(10,2) [not null]
+  updated_at datetime [not null]
+}
+
+Table category{
+  id int [primary key, increment]
+  name varchar [not null]
+}
+
+Table category_products{
+  id int [primary key, increment]
+  category_id int [not null]
+  product_id int [not null]
+}
+
+Table stock{
+  id int [primary key, increment]
+  warehouse_id int [not null]
+  product_id int [not null]
+  quantity int [not null]
+  version int
+  updated_at datetime
+  reorder_threshold int
+}
+
+Ref: stock.warehouse_id > warehouse.id
+Ref: stock.product_id > products.id
+
+Table purchase_order{
+  id int [primary key, increment]
+  supplier_id int [not null]
+  created_by int [not null]
+  is_auto_generated boolean [not null]
+  created_at datetime [not null]
+  approved_by int
+  approved_status varchar
+  status varchar
+}
+
+
+Table users{
+  id int [primary key, increment]
+  name varchar [not null]
+  email varchar [unique, not null]
+  password_hash varchar [not null]
+  role varchar [not null]
+  warehouse_id int
+  created_at datetime [not null]
+}
+
+Ref: "users"."warehouse_id" > "warehouse"."id"
+
+Ref: "purchase_order"."approved_by" > "users"."id"
+
+
+
+Ref: "purchase_order"."created_by" > "users"."id"
+
+Table suppliers{
+  id int [primary key, increment]
+  name varchar [not null]
+  email varchar
+  phone varchar
+}
+
+Table supplier_products{
+  id int [primary key, increment]
+  supplier_id int [not null]
+  product_id int [not null]
+  supplier_sku varchar [not null]
+  unit_price decimal(10,2) [not null]
+  time_required_in_days int [not null]
+}
+
+Ref: "purchase_order"."supplier_id" > "suppliers"."id"
+
+Table purchase_order_receipts{
+  id int [pk, increment]
+  purchase_order_id int [not null]
+  purchase_order_contains_id int [not null]
+  product_id int [not null]
+  quantity_received int [not null]
+  condition_notes text
+  received_at datetime [not null]
+}
+
+Table purchase_order_contains{
+  id int [primary key, increment]
+  purchase_order_id int [not null]
+  product_id int [not null]
+  warehouse_id int [not null]
+  quantity_ordered int [not null]
+  unit_price decimal(10,2) [not null]
+  expected_date datetime [not null]
+  status varchar [not null]
+}
+
+Ref: "purchase_order_receipts"."purchase_order_id" > "purchase_order"."id"
+
+
+
+Table stock_ledger{
+  id int [primary key, increment]
+  product_id int [not null]
+  warehouse_id int [not null]
+  user_id int [not null]
+  change_quantity int [not null]
+  created_at datetime [not null, default: `now()`]
+  reference_type varchar
+  reference_id int
+  transaction_type varchar [not null]
+  notes varchar
+}
+
+Ref: "stock_ledger"."product_id" > "products"."id"
+
+Ref: "stock_ledger"."warehouse_id" > "warehouse"."id"
+
+Ref: "stock_ledger"."user_id" > "users"."id"
+
+Table orders{
+  id int [primary key,increment]
+  warehouse_id int [not null]
+  external_reference_id varchar [not null, unique]
+  order_status varchar [not null]
+  payment_status varchar [not null]
+  total_amount Decimal(10,2) [not null]
+  created_at datetime [default: `now()`]
+}
+
+
+
+
+
+Table order_contains{
+  id int [primary key, increment]
+  order_id int [not null]
+  product_id int [not null]
+  quantity int [not null]
+  unit_price decimal(10,2) [not null]
+}
+
+Ref: "order_contains"."order_id" > "orders"."id"
+
+Ref: "order_contains"."product_id" > "products"."id"
+
+
+Table reservation{
+  id int [primary key, increment]
+  order_id int [not null]
+  order_contains_id int [not null]
+  warehouse_id int [not null]
+  product_id int [not null]
+  quantity int [not null]
+  created_at datetime [not null, default: `now()`]
+  expire_at datetime [not null]
+  status varchar [not null]
+}
+
+Ref: "reservation"."order_id" > "orders"."id"
+
+Ref: "orders"."warehouse_id" > "warehouse"."id"
+
+Ref: "reservation"."order_contains_id" > "order_contains"."id"
+
+Ref: "reservation"."warehouse_id" > "warehouse"."id"
+
+Ref: "reservation"."product_id" > "products"."id"
+
+Table financial_ledger{
+  id int [primary key, increment]
+  order_id int [not null]
+  transaction_id varchar [unique, not null]
+  transaction_type varchar [not null]
+  amount decimal(10,2) [not null]
+  payment_mode varchar [not null]
+  status varchar [not null]
+  idempotency_key varchar [unique]
+  parent_transaction_id int
+  created_at datetime [not null]
+}
+
+
+Ref: "financial_ledger"."order_id" > "orders"."id"
+
+Table returns{
+  id int [primary key, increment]
+  order_id int 
+  financial_ledger_id int 
+  reason text [not null]
+  status varchar [not null]
+  created_at datetime [not null, default: `now()`]
+  return_type varchar [not null]
+  replacement_order_id int
+}
+
+Table return_contains{
+  id int [primary key, increment]
+  return_id int [not null]
+  order_contains_id int [not null]
+  product_id int [not null]
+  warehouse_id int [not null]
+  quantity_expected int [not null]
+  return_unit_price decimal(10,2) [not null]
+  status varchar [not null]
+}
+
+Table return_reciepts{
+  id int [primary key, increment]
+  return_id int [not null]
+  return_contains_id int [not null]
+  product_id int [not null]
+  quantity_received int [not null]
+  condition_status varchar [not null]
+  condition_notes text [not null]
+  status varchar [not null]
+  received_by int [not null]
+  received_at datetime [not null]
+}
+Ref: "orders"."id" - "returns"."order_id"
+
+Ref: "returns"."financial_ledger_id" > "financial_ledger"."id"
+
+Ref: "return_contains"."return_id" > "returns"."id"
+
+Ref: "return_contains"."order_contains_id" > "order_contains"."id"
+
+Ref: "return_contains"."product_id" > "products"."id"
+
+Ref: "return_contains"."warehouse_id" > "warehouse"."id"
+
+Table delivery{
+  id int [primary key, increment]
+  order_id int [not null]
+  agent_id int [not null]
+  scheduled_at datetime [not null]
+  status varchar [not null]
+  delivery_address text [not null]
+  delivery_for varchar [not null]
+  delivered_to varchar [not null]
+}
+
+Table cancellation{
+  id int [primary key, increment]
+  order_id int [not null]
+  reason text [not null]
+  cancelled_by int 
+  created_at datetime [not null]
+  financial_ledger_id int
+  status varchar [not null]
+}
+
+Ref: "delivery"."order_id" > "orders"."id"
+  
+
+
+Ref: "purchase_order_contains"."purchase_order_id" > "purchase_order"."id"
+
+Ref: "purchase_order_contains"."warehouse_id" > "warehouse"."id"
+
+Ref: "purchase_order_contains"."product_id" > "products"."id"
+
+Ref: "purchase_order_receipts"."purchase_order_contains_id" > "purchase_order_contains"."id"
+
+Table transfer{
+  id int [primary key, increment]
+  source_warehouse_id int [not null]
+  destination_warehouse_id int [not null]
+  initiated_by int [not null]
+  transport_mode varchar [not null]
+  status varchar [not null]
+  dispatched_at datetime [not null]
+  created_at datetime [not null, default: `now()`]  
+  expected_completion datetime [not null]
+
+}
+
+Table transfer_contains{
+  id int [primary key, increment]
+  transfer_id int [not null]
+  product_id int [not null]
+  quantity_dispatched int [not null]
+  status varchar [not null]
+  dispatched_at datetime [not null]
+}
+
+Table transfer_receipt{
+  id int [primary key, increment]
+  transfer_id int [not null]
+  transfer_contains_id int [not null]
+  product_id int [not null]
+  quantity_received int [not null]
+  received_by int [not null]
+  arrived_at datetime [not null]
+  status varchar [not null]
+}
+
+Ref: "transfer"."source_warehouse_id" > "warehouse"."id"
+
+Ref: "transfer"."destination_warehouse_id" > "warehouse"."id"
+
+Ref: "transfer"."initiated_by" > "users"."id"
+
+Ref: "transfer_receipt"."transfer_id" > "transfer"."id"
+
+Ref: "transfer_receipt"."transfer_contains_id" > "transfer_contains"."id"
+
+Ref: "transfer_contains"."transfer_id" > "transfer"."id"
+
+Ref: "transfer_contains"."product_id" > "products"."id"
+
+Ref: "transfer_receipt"."product_id" > "products"."id"
+
+Ref: "transfer_receipt"."received_by" > "users"."id"
+
+Ref: "supplier_products"."supplier_id" > "suppliers"."id"
+
+Ref: "supplier_products"."product_id" > "products"."id"
+
+Ref: "category_products"."category_id" > "category"."id"
+
+Ref: "category_products"."product_id" > "products"."id"
+
+
+
+Ref: "return_reciepts"."return_id" > "returns"."id"
+
+Ref: "return_reciepts"."return_contains_id" > "return_contains"."id"
+
+Ref: "return_reciepts"."product_id" > "products"."id"
+
+Ref: "return_reciepts"."received_by" > "users"."id"
+
+Ref: "cancellation"."order_id" > "orders"."id"
+
+Ref: "cancellation"."cancelled_by" > "users"."id"
+
+
+Ref: "cancellation"."financial_ledger_id" > "financial_ledger"."id"
+
+Ref: "financial_ledger"."parent_transaction_id" > "financial_ledger"."id"
+
+Ref: "returns"."replacement_order_id" ?>? "orders"."id"
