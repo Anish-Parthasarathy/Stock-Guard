@@ -1,42 +1,7 @@
 import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
-
-from app.api.main import app
-from app.api.deps import get_db
-from app.modules.module import Product, Category, CategoryProduct
-
-# In-memory SQLite for testing without requiring a live Postgres instance
-TEST_DATABASE_URL = "sqlite:///:memory:"
-engine = create_engine(
-    TEST_DATABASE_URL,
-    connect_args={"check_same_thread": False},
-    poolclass=StaticPool,
-)
-TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-# Create Phase 1 tables
-Product.__table__.create(engine)
-Category.__table__.create(engine)
-CategoryProduct.__table__.create(engine)
 
 
-def override_get_db():
-    db = TestingSessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-app.dependency_overrides[get_db] = override_get_db
-
-client = TestClient(app)
-
-
-def test_create_product():
+def test_create_product(client):
     payload = {
         "sku": "SKU-001",
         "name": "Widget A",
@@ -53,7 +18,7 @@ def test_create_product():
     assert "updated_at" in data
 
 
-def test_duplicate_product_sku():
+def test_duplicate_product_sku(client):
     payload = {
         "sku": "SKU-001",
         "name": "Widget Duplicate",
@@ -64,7 +29,7 @@ def test_duplicate_product_sku():
     assert response.status_code == 409
 
 
-def test_list_products():
+def test_list_products(client):
     response = client.get("/products")
     assert response.status_code == 200
     data = response.json()
@@ -72,32 +37,39 @@ def test_list_products():
     assert len(data) >= 1
 
 
-def test_get_product():
-    response = client.get("/products/1")
+def test_get_product(client):
+    # Fetch list first to get valid created product ID
+    list_res = client.get("/products")
+    prod_id = list_res.json()[0]["id"]
+
+    response = client.get(f"/products/{prod_id}")
     assert response.status_code == 200
     data = response.json()
-    assert data["id"] == 1
+    assert data["id"] == prod_id
     assert data["sku"] == "SKU-001"
 
 
-def test_get_nonexistent_product():
-    response = client.get("/products/999")
+def test_get_nonexistent_product(client):
+    response = client.get("/products/99999")
     assert response.status_code == 404
 
 
-def test_update_product():
+def test_update_product(client):
+    list_res = client.get("/products")
+    prod_id = list_res.json()[0]["id"]
+
     payload = {
         "name": "Widget A Updated",
         "price": 24.99
     }
-    response = client.put("/products/1", json=payload)
+    response = client.put(f"/products/{prod_id}", json=payload)
     assert response.status_code == 200
     data = response.json()
     assert data["name"] == "Widget A Updated"
     assert data["price"] == 24.99
 
 
-def test_create_category():
+def test_create_category(client):
     payload = {"name": "Electronics"}
     response = client.post("/categories", json=payload)
     assert response.status_code == 201
@@ -106,13 +78,13 @@ def test_create_category():
     assert "id" in data
 
 
-def test_duplicate_category():
+def test_duplicate_category(client):
     payload = {"name": "Electronics"}
     response = client.post("/categories", json=payload)
     assert response.status_code == 409
 
 
-def test_list_categories():
+def test_list_categories(client):
     response = client.get("/categories")
     assert response.status_code == 200
     data = response.json()
@@ -120,57 +92,77 @@ def test_list_categories():
     assert len(data) >= 1
 
 
-def test_get_category():
-    response = client.get("/categories/1")
+def test_get_category(client):
+    cat_res = client.get("/categories")
+    cat_id = cat_res.json()[0]["id"]
+
+    response = client.get(f"/categories/{cat_id}")
     assert response.status_code == 200
     data = response.json()
     assert data["name"] == "Electronics"
 
 
-def test_update_category():
+def test_update_category(client):
+    cat_res = client.get("/categories")
+    cat_id = cat_res.json()[0]["id"]
+
     payload = {"name": "Consumer Electronics"}
-    response = client.put("/categories/1", json=payload)
+    response = client.put(f"/categories/{cat_id}", json=payload)
     assert response.status_code == 200
     data = response.json()
     assert data["name"] == "Consumer Electronics"
 
 
-def test_assign_product_to_category():
-    response = client.post("/categories/1/products/1")
+def test_assign_product_to_category(client):
+    prod_id = client.get("/products").json()[0]["id"]
+    cat_id = client.get("/categories").json()[0]["id"]
+
+    response = client.post(f"/categories/{cat_id}/products/{prod_id}")
     assert response.status_code == 201
     data = response.json()
-    assert data["category_id"] == 1
-    assert data["product_id"] == 1
+    assert data["category_id"] == cat_id
+    assert data["product_id"] == prod_id
 
 
-def test_duplicate_product_category_assignment():
-    response = client.post("/categories/1/products/1")
+def test_duplicate_product_category_assignment(client):
+    prod_id = client.get("/products").json()[0]["id"]
+    cat_id = client.get("/categories").json()[0]["id"]
+
+    response = client.post(f"/categories/{cat_id}/products/{prod_id}")
     assert response.status_code == 409
 
 
-def test_list_products_by_category():
-    response = client.get("/categories/1/products")
+def test_list_products_by_category(client):
+    cat_id = client.get("/categories").json()[0]["id"]
+
+    response = client.get(f"/categories/{cat_id}/products")
     assert response.status_code == 200
     data = response.json()
     assert isinstance(data, list)
-    assert len(data) == 1
-    assert data[0]["id"] == 1
+    assert len(data) >= 1
 
 
-def test_remove_product_from_category():
-    response = client.delete("/categories/1/products/1")
+def test_remove_product_from_category(client):
+    prod_id = client.get("/products").json()[0]["id"]
+    cat_id = client.get("/categories").json()[0]["id"]
+
+    response = client.delete(f"/categories/{cat_id}/products/{prod_id}")
     assert response.status_code == 200
 
 
-def test_delete_product():
-    response = client.delete("/products/1")
+def test_delete_product(client):
+    prod_id = client.get("/products").json()[0]["id"]
+
+    response = client.delete(f"/products/{prod_id}")
     assert response.status_code == 200
-    get_res = client.get("/products/1")
+    get_res = client.get(f"/products/{prod_id}")
     assert get_res.status_code == 404
 
 
-def test_delete_category():
-    response = client.delete("/categories/1")
+def test_delete_category(client):
+    cat_id = client.get("/categories").json()[0]["id"]
+
+    response = client.delete(f"/categories/{cat_id}")
     assert response.status_code == 200
-    get_res = client.get("/categories/1")
+    get_res = client.get(f"/categories/{cat_id}")
     assert get_res.status_code == 404

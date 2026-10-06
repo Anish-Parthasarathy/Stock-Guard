@@ -6,7 +6,7 @@ from app.repository.warehouse import create_warehouse, select_warehouse, DATABAS
 def warehouse_create(warehouse: WarehouseCreate, db: Session):
   
     warehouse_details = WarehouseGet.model_validate(warehouse, from_attributes=True)
-    existing_warehouse = select_warehouse(warehouse_details, db)
+    existing_warehouse = select_warehouse(db, warehouse_details)
     
     if(existing_warehouse != None):
 
@@ -42,7 +42,7 @@ def warehouse_create(warehouse: WarehouseCreate, db: Session):
 
 def warehouse_get(warehouse: WarehouseGet, db: Session):
 
-    warehouse = select_warehouse(warehouse, db)
+    warehouse = select_warehouse(db, warehouse)
 
     if warehouse is not None: 
 

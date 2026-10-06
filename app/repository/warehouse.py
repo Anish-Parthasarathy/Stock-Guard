@@ -6,10 +6,17 @@ from app.modules.module import Warehouse
 from app.repository.exceptions import INTERNALDATABASEERROR, DATABASEINTEGRITYERROR, DATABASEOPERATIONALERROR
 
  
+from datetime import datetime, timezone
+
 def create_warehouse(db: Session, warehouse: WarehouseCreate):
     
     try:
-        new_warehouse = Warehouse(name = warehouse.name, location = warehouse.location, capacity = warehouse.capacity)
+        new_warehouse = Warehouse(
+            name = warehouse.name,
+            location = warehouse.location,
+            capacity = warehouse.capacity,
+            created_at = datetime.now(timezone.utc).date()
+        )
         
         db.add(new_warehouse)   
         db.commit()
