@@ -1,7 +1,8 @@
 import uuid
 from datetime import datetime, timezone
 from typing import Optional, List
-from sqlalchemy import select
+from sqlalchemy import select, func
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError, OperationalError
 from app.modules.module import (
@@ -80,33 +81,37 @@ def cancel_order_atomic(
             refund_entry_id = refund_entry.id
             order.payment_status = 'REFUNDED'
 
-            # Restock fulfilled items back to inventory
+            # Restock fulfilled items back to inventory in deterministic product_id ASC order
             items_stmt = select(OrderContains).where(OrderContains.order_id == order.id)
             items = list(db.scalars(items_stmt).all())
-            for it in items:
-                stock_stmt = select(Stock).where(
-                    Stock.warehouse_id == order.warehouse_id,
-                    Stock.product_id == it.product_id
-                )
-                stock = db.scalar(stock_stmt)
-                if stock:
-                    stock.quantity += it.quantity
-                    stock.version = (stock.version or 1) + 1
-                    stock.updated_at = now_utc
-                else:
-                    stock = Stock(
+            sorted_items = sorted(items, key=lambda it: it.product_id)
+            for it in sorted_items:
+                upsert_stmt = (
+                    pg_insert(Stock)
+                    .values(
                         warehouse_id=order.warehouse_id,
                         product_id=it.product_id,
                         quantity=it.quantity,
                         version=1,
-                        updated_at=now_utc,
+                        updated_at=func.now(),
                         reorder_threshold=0
                     )
-                    db.add(stock)
+                    .on_conflict_do_update(
+                        constraint="uq_stock_warehouse_product",
+                        set_={
+                            "quantity": Stock.quantity + it.quantity,
+                            "version": Stock.version + 1,
+                            "updated_at": func.now()
+                        }
+                    )
+                    .returning(Stock)
+                )
+                res = db.execute(upsert_stmt, execution_options={"populate_existing": True})
+                stock = res.scalar_one()
 
                 ledger = StockLedger(
-                    warehouse_id=order.warehouse_id,
-                    product_id=it.product_id,
+                    warehouse_id=stock.warehouse_id,
+                    product_id=stock.product_id,
                     user_id=user_id,
                     change_quantity=it.quantity,
                     reference_type=ReferenceType.CANCELLATION,
@@ -117,8 +122,12 @@ def cancel_order_atomic(
                 )
                 db.add(ledger)
         else:
-            # Release any active stock reservations
-            res_stmt = select(Reservation).where(Reservation.order_id == order.id)
+            # Release any active stock reservations under row lock
+            res_stmt = (
+                select(Reservation)
+                .where(Reservation.order_id == order.id)
+                .with_for_update()
+            )
             reservations = list(db.scalars(res_stmt).all())
             for r in reservations:
                 if r.status == 'RESERVED':
@@ -140,12 +149,12 @@ def cancel_order_atomic(
         db.refresh(cancellation)
         db.refresh(order)
         return cancellation
+    except OperationalError:
+        db.rollback()
+        raise
     except IntegrityError:
         db.rollback()
         raise DATABASEINTEGRITYERROR()
-    except OperationalError:
-        db.rollback()
-        raise DATABASEOPERATIONALERROR()
     except SQLAlchemyError:
         db.rollback()
         raise INTERNALDATABASEERROR()

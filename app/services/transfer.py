@@ -25,7 +25,14 @@ from app.repository.stock import (
     select_user_by_email
 )
 from app.repository.order import select_active_reservations_quantity
-from app.repository.exceptions import DATABASEINTEGRITYERROR, INTERNALDATABASEERROR, DATABASEOPERATIONALERROR
+from app.core.database import run_in_transaction_with_retry
+from sqlalchemy.exc import OperationalError
+from app.repository.exceptions import (
+    DATABASEINTEGRITYERROR,
+    INTERNALDATABASEERROR,
+    DATABASEOPERATIONALERROR,
+    ConcurrencyDeadlockError,
+)
 
 
 def _build_transfer_response(db: Session, transfer) -> TransferResponse:
@@ -125,14 +132,23 @@ def transfer_dispatch(
             )
 
     try:
-        new_transfer = dispatch_transfer_atomic(db, transfer_data, user.id)
+        new_transfer = run_in_transaction_with_retry(
+            db,
+            lambda s: dispatch_transfer_atomic(s, transfer_data, user.id)
+        )
         return _build_transfer_response(db, new_transfer)
+    except ConcurrencyDeadlockError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=e.message,
+            headers={"Retry-After": str(e.retry_after)}
+        )
     except DATABASEINTEGRITYERROR as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e)
         )
-    except DATABASEOPERATIONALERROR as e:
+    except (DATABASEOPERATIONALERROR, OperationalError) as e:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(e)
@@ -233,21 +249,30 @@ def transfer_receive_item(
         )
 
     try:
-        receipt, _ = receive_transfer_item_atomic(
-            db=db,
-            transfer=transfer,
-            item=item,
-            quantity_received=receipt_data.quantity_received,
-            receipt_status=receipt_data.status,
-            user_id=user.id
+        receipt, _ = run_in_transaction_with_retry(
+            db,
+            lambda s: receive_transfer_item_atomic(
+                db=s,
+                transfer=transfer,
+                item=item,
+                quantity_received=receipt_data.quantity_received,
+                receipt_status=receipt_data.status,
+                user_id=user.id
+            )
         )
         return TransferReceiptResponse.model_validate(receipt, from_attributes=True)
+    except ConcurrencyDeadlockError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=e.message,
+            headers={"Retry-After": str(e.retry_after)}
+        )
     except DATABASEINTEGRITYERROR as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e)
         )
-    except DATABASEOPERATIONALERROR as e:
+    except (DATABASEOPERATIONALERROR, OperationalError) as e:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(e)

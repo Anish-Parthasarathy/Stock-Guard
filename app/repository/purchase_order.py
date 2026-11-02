@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from typing import Optional, List, Tuple
 from sqlalchemy import select, func
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError, OperationalError
 from app.schemas.schema import PurchaseOrderCreate
@@ -212,6 +213,10 @@ def receive_po_item_atomic(
     5. Records StockLedger audit entry with reference_type='PURCHASE_ORDER'
     """
     try:
+        # Lock PO header to serialize concurrent item receipts
+        po = db.scalar(
+            select(PurchaseOrder).where(PurchaseOrder.id == po.id).with_for_update()
+        )
         # 1. Create Receipt
         receipt = PurchaseOrderReceipt(
             purchase_order_id=po.id,
@@ -245,31 +250,34 @@ def receive_po_item_atomic(
         else:
             po.status = PurchaseOrderStatus.PARTIALLY_RECEIVED
 
-        # 4. Increment Stock (or create stock if not present)
-        stock_stmt = select(Stock).where(
-            Stock.warehouse_id == item.warehouse_id,
-            Stock.product_id == item.product_id
-        )
-        stock = db.scalar(stock_stmt)
-        if stock is not None:
-            stock.quantity += quantity_received
-            stock.version = (stock.version or 1) + 1
-            stock.updated_at = datetime.now(timezone.utc)
-        else:
-            stock = Stock(
+        # 4. Atomic PostgreSQL upsert targeting uq_stock_warehouse_product
+        upsert_stmt = (
+            pg_insert(Stock)
+            .values(
                 warehouse_id=item.warehouse_id,
                 product_id=item.product_id,
                 quantity=quantity_received,
                 version=1,
-                updated_at=datetime.now(timezone.utc),
+                updated_at=func.now(),
                 reorder_threshold=0
             )
-            db.add(stock)
+            .on_conflict_do_update(
+                constraint="uq_stock_warehouse_product",
+                set_={
+                    "quantity": Stock.quantity + quantity_received,
+                    "version": Stock.version + 1,
+                    "updated_at": func.now()
+                }
+            )
+            .returning(Stock)
+        )
+        res = db.execute(upsert_stmt, execution_options={"populate_existing": True})
+        stock = res.scalar_one()
 
-        # 5. Insert StockLedger audit entry
+        # 5. Insert StockLedger audit entry using authoritative returned values
         ledger = StockLedger(
-            warehouse_id=item.warehouse_id,
-            product_id=item.product_id,
+            warehouse_id=stock.warehouse_id,
+            product_id=stock.product_id,
             user_id=user_id,
             change_quantity=quantity_received,
             reference_type=ReferenceType.PURCHASE_ORDER,
@@ -292,7 +300,7 @@ def receive_po_item_atomic(
         raise DATABASEINTEGRITYERROR()
     except OperationalError:
         db.rollback()
-        raise DATABASEOPERATIONALERROR()
+        raise
     except SQLAlchemyError:
         db.rollback()
         raise INTERNALDATABASEERROR()

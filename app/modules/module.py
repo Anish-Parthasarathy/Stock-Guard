@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from app.core.database import Base
 from typing import Optional, List
-from sqlalchemy import String, Integer, Numeric, DateTime, Boolean, ForeignKey, Text, Date, CheckConstraint, Enum as SQLEnum
+from sqlalchemy import String, Integer, Numeric, DateTime, Boolean, ForeignKey, Text, Date, CheckConstraint, UniqueConstraint, Index, Enum as SQLEnum
 from sqlalchemy.sql import func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 import enum
@@ -114,10 +114,17 @@ class Stock(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     warehouse_id: Mapped[int] = mapped_column(ForeignKey('warehouse.id'), nullable=False)
     product_id: Mapped[int] = mapped_column(ForeignKey('products.id'), nullable=False)
-    quantity: Mapped[int] = mapped_column(Integer, CheckConstraint('quantity >= 0',name='check_stock_quantity'),  nullable=False)
-    version: Mapped[Optional[int]] = mapped_column(Integer, CheckConstraint('version > 0',name='check_stock_version'),nullable=False)
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    version: Mapped[Optional[int]] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
-    reorder_threshold: Mapped[int] = mapped_column(Integer, CheckConstraint('reorder_threshold >= 0',name='check_stock_reorder_threshold'),nullable=False)
+    reorder_threshold: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('warehouse_id', 'product_id', name='uq_stock_warehouse_product'),
+        CheckConstraint('quantity >= 0', name='check_stock_quantity'),
+        CheckConstraint('version > 0', name='check_stock_version'),
+        CheckConstraint('reorder_threshold >= 0', name='check_stock_reorder_threshold'),
+    )
 
 class StockLedger(Base):
     __tablename__ = 'stock_ledger'
@@ -206,6 +213,10 @@ class Reservation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     expire_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False)
+
+    __table_args__ = (
+        Index('ix_reservation_warehouse_id_product_id_status_expire_at', 'warehouse_id', 'product_id', 'status', 'expire_at'),
+    )
 
 class Delivery(Base):
     __tablename__ = 'delivery'

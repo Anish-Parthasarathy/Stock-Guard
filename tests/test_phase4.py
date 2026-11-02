@@ -103,7 +103,7 @@ def test_order_overselling_prevention(client, seeded_warehouse, product_with_sto
         ]
     }
     order_res = client.post("/orders", json=order_payload)
-    assert order_res.status_code == 400
+    assert order_res.status_code in (400, 409)
 
 
 def test_release_reservation(client, seeded_warehouse, product_with_stock):

@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from typing import Optional, List, Tuple
-from sqlalchemy import select, func
+from sqlalchemy import select, update, func
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError, OperationalError
 from app.schemas.schema import TransferCreate
@@ -116,7 +117,9 @@ def dispatch_transfer_atomic(
         db.add(transfer)
         db.flush()
 
-        for item_data in transfer_data.items:
+        # Sort line items by product_id ASC for deterministic lock ordering
+        sorted_items = sorted(transfer_data.items, key=lambda it: it.product_id)
+        for item_data in sorted_items:
             line_item = TransferContains(
                 transfer_id=transfer.id,
                 product_id=item_data.product_id,
@@ -126,25 +129,32 @@ def dispatch_transfer_atomic(
             )
             db.add(line_item)
 
-            # Deduct stock at source warehouse
-            stock_stmt = select(Stock).where(
-                Stock.warehouse_id == transfer_data.source_warehouse_id,
-                Stock.product_id == item_data.product_id
+            # Atomic SQL deduction at source warehouse
+            update_stmt = (
+                update(Stock)
+                .where(
+                    Stock.warehouse_id == transfer_data.source_warehouse_id,
+                    Stock.product_id == item_data.product_id,
+                    Stock.quantity >= item_data.quantity_dispatched
+                )
+                .values(
+                    quantity=Stock.quantity - item_data.quantity_dispatched,
+                    version=Stock.version + 1,
+                    updated_at=now_utc
+                )
+                .returning(Stock)
             )
-            stock = db.scalar(stock_stmt)
-            if not stock or stock.quantity < item_data.quantity_dispatched:
+            res = db.execute(update_stmt, execution_options={"populate_existing": True})
+            updated_stock = res.scalar_one_or_none()
+            if updated_stock is None:
                 raise ValueError(
                     f"Insufficient stock for product {item_data.product_id} at source warehouse {transfer_data.source_warehouse_id}"
                 )
 
-            stock.quantity -= item_data.quantity_dispatched
-            stock.version = (stock.version or 1) + 1
-            stock.updated_at = now_utc
-
-            # Write stock audit ledger
+            # Write stock audit ledger directly from authoritative returned stock
             ledger_entry = StockLedger(
-                warehouse_id=transfer_data.source_warehouse_id,
-                product_id=item_data.product_id,
+                warehouse_id=updated_stock.warehouse_id,
+                product_id=updated_stock.product_id,
                 user_id=user_id,
                 change_quantity=item_data.quantity_dispatched,
                 reference_type=ReferenceType.TRANSFER,
@@ -163,7 +173,7 @@ def dispatch_transfer_atomic(
         raise DATABASEINTEGRITYERROR()
     except OperationalError:
         db.rollback()
-        raise DATABASEOPERATIONALERROR()
+        raise
     except SQLAlchemyError:
         db.rollback()
         raise INTERNALDATABASEERROR()
@@ -187,6 +197,10 @@ def receive_transfer_item_atomic(
     """
     now_utc = datetime.now(timezone.utc)
     try:
+        # Lock Transfer record with FOR UPDATE to eliminate status transition race conditions
+        transfer = db.scalar(
+            select(Transfer).where(Transfer.id == transfer.id).with_for_update()
+        )
         receipt = TransferReceipt(
             transfer_id=transfer.id,
             transfer_contains_id=item.id,
@@ -220,31 +234,34 @@ def receive_transfer_item_atomic(
         else:
             transfer.status = 'PARTIALLY_RECEIVED'
 
-        # Increment Stock at destination warehouse
-        dest_stock_stmt = select(Stock).where(
-            Stock.warehouse_id == transfer.destination_warehouse_id,
-            Stock.product_id == item.product_id
-        )
-        dest_stock = db.scalar(dest_stock_stmt)
-        if dest_stock is not None:
-            dest_stock.quantity += quantity_received
-            dest_stock.version = (dest_stock.version or 1) + 1
-            dest_stock.updated_at = now_utc
-        else:
-            dest_stock = Stock(
+        # Atomic PostgreSQL upsert targeting uq_stock_warehouse_product
+        upsert_stmt = (
+            pg_insert(Stock)
+            .values(
                 warehouse_id=transfer.destination_warehouse_id,
                 product_id=item.product_id,
                 quantity=quantity_received,
                 version=1,
-                updated_at=now_utc,
+                updated_at=func.now(),
                 reorder_threshold=0
             )
-            db.add(dest_stock)
+            .on_conflict_do_update(
+                constraint="uq_stock_warehouse_product",
+                set_={
+                    "quantity": Stock.quantity + quantity_received,
+                    "version": Stock.version + 1,
+                    "updated_at": func.now()
+                }
+            )
+            .returning(Stock)
+        )
+        res = db.execute(upsert_stmt, execution_options={"populate_existing": True})
+        dest_stock = res.scalar_one()
 
-        # Audit ledger at destination warehouse
+        # Audit ledger at destination warehouse using authoritative returned stock
         ledger_entry = StockLedger(
-            warehouse_id=transfer.destination_warehouse_id,
-            product_id=item.product_id,
+            warehouse_id=dest_stock.warehouse_id,
+            product_id=dest_stock.product_id,
             user_id=user_id,
             change_quantity=quantity_received,
             reference_type=ReferenceType.TRANSFER,
@@ -266,7 +283,7 @@ def receive_transfer_item_atomic(
         raise DATABASEINTEGRITYERROR()
     except OperationalError:
         db.rollback()
-        raise DATABASEOPERATIONALERROR()
+        raise
     except SQLAlchemyError:
         db.rollback()
         raise INTERNALDATABASEERROR()

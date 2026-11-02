@@ -3,6 +3,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, List
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
+from app.modules.module import Order, FinancialLedger
 from app.schemas.schema import (
     OrderCreate,
     OrderResponse,
@@ -14,6 +15,7 @@ from app.schemas.schema import (
 from app.repository.order import (
     select_orders,
     select_order_by_id,
+    select_order_by_id_for_update,
     select_order_by_external_ref,
     select_order_items,
     select_order_reservations,
@@ -33,7 +35,16 @@ from app.repository.stock import (
     select_stock_by_warehouse_product,
     select_user_by_email
 )
-from app.repository.exceptions import DATABASEINTEGRITYERROR, INTERNALDATABASEERROR, DATABASEOPERATIONALERROR
+from app.core.database import run_in_transaction_with_retry
+from sqlalchemy.exc import OperationalError
+from app.repository.exceptions import (
+    DATABASEINTEGRITYERROR,
+    INTERNALDATABASEERROR,
+    DATABASEOPERATIONALERROR,
+    InsufficientStockError,
+    ConcurrencyDeadlockError,
+    ReservationExpiredError,
+)
 
 
 def _build_order_response(db: Session, order) -> OrderResponse:
@@ -74,7 +85,6 @@ def order_create_and_reserve(order_data: OrderCreate, db: Session) -> OrderRespo
             detail="Duplicate product_id found in order items"
         )
 
-    # Validate each line item & inventory availability before creating holds
     total_amount = 0.0
     for item in order_data.items:
         prod = select_product_by_id(db, item.product_id)
@@ -83,35 +93,33 @@ def order_create_and_reserve(order_data: OrderCreate, db: Session) -> OrderRespo
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Product with ID {item.product_id} not found"
             )
-
-        stock = select_stock_by_warehouse_product(db, order_data.warehouse_id, item.product_id)
-        if not stock:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"No stock record exists for Product {item.product_id} in Warehouse {order_data.warehouse_id}"
-            )
-
-        active_reserved = select_active_reservations_quantity(db, order_data.warehouse_id, item.product_id)
-        available = stock.quantity - active_reserved
-        if available < item.quantity:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Insufficient available stock for Product {item.product_id}. Available: {available}, requested: {item.quantity}"
-            )
-
         total_amount += round(item.quantity * item.unit_price, 2)
 
     expire_at = datetime.now(timezone.utc) + timedelta(minutes=order_data.reservation_duration_minutes)
 
     try:
-        new_order = insert_order_with_items_and_reservations(db, order_data, total_amount, expire_at)
+        new_order = run_in_transaction_with_retry(
+            db,
+            lambda s: insert_order_with_items_and_reservations(s, order_data, total_amount, expire_at)
+        )
         return _build_order_response(db, new_order)
+    except InsufficientStockError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=e.message
+        )
+    except ConcurrencyDeadlockError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=e.message,
+            headers={"Retry-After": str(e.retry_after)}
+        )
     except DATABASEINTEGRITYERROR as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e)
         )
-    except DATABASEOPERATIONALERROR as e:
+    except (DATABASEOPERATIONALERROR, OperationalError) as e:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(e)
@@ -172,75 +180,87 @@ def order_process_payment(
             detail="Authenticated user not found"
         )
 
-    order = select_order_by_id(db, order_id)
-    if not order:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Order with ID {order_id} not found"
-        )
-
-    if order.order_status == 'CANCELLED':
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot process payment for a cancelled order"
-        )
-
-    if order.payment_status == 'PAID':
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Order is already paid"
-        )
-
-    order_total = round(float(order.total_amount), 2)
-    if round(payment_data.amount, 2) < order_total:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Payment amount ({payment_data.amount}) is less than order total ({order_total})"
-        )
-
-    # Idempotency check: if key already exists, return existing transaction safely
     clean_idempotency_key = payment_data.idempotency_key.strip() if payment_data.idempotency_key and payment_data.idempotency_key.strip() else None
-    if clean_idempotency_key:
-        existing_txn = select_financial_by_idempotency_key(db, clean_idempotency_key)
-        if existing_txn:
-            return FinancialLedgerResponse.model_validate(existing_txn, from_attributes=True)
 
-    items = select_order_items(db, order.id)
-    reservations = select_order_reservations(db, order.id)
-
-    # Verify inventory is sufficient to complete deduction
-    for item in items:
-        stock = select_stock_by_warehouse_product(db, order.warehouse_id, item.product_id)
-        if not stock or stock.quantity < item.quantity:
+    def _settle_payment_tx(session: Session) -> FinancialLedger:
+        # 1. Pessimistic Order Row Locking
+        order = select_order_by_id_for_update(session, order_id)
+        if not order:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Insufficient inventory in warehouse to fulfill Product {item.product_id}"
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Order with ID {order_id} not found"
             )
 
-    txn_id = payment_data.transaction_id or f"TXN-{uuid.uuid4().hex[:12].upper()}"
-    existing_by_id = select_financial_by_transaction_id(db, txn_id)
-    if existing_by_id:
-        txn_id = f"TXN-{uuid.uuid4().hex[:12].upper()}"
+        # 2. Idempotency-First Payment Processing: check financial_ledger BEFORE inspecting order status
+        if clean_idempotency_key:
+            existing_txn = select_financial_by_idempotency_key(session, clean_idempotency_key)
+            if existing_txn:
+                return existing_txn
 
-    try:
-        financial_entry = fulfill_order_payment_atomic(
-            db=db,
+        # 3. Finite-State Transition Checks
+        if order.order_status == 'CANCELLED':
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot process payment for a cancelled order"
+            )
+
+        if order.payment_status == 'PAID':
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Order is already paid"
+            )
+
+        order_total = round(float(order.total_amount), 2)
+        if round(payment_data.amount, 2) < order_total:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Payment amount ({payment_data.amount}) is less than order total ({order_total})"
+            )
+
+        txn_id = payment_data.transaction_id or f"TXN-{uuid.uuid4().hex[:12].upper()}"
+        existing_by_id = select_financial_by_transaction_id(session, txn_id)
+        if existing_by_id:
+            txn_id = f"TXN-{uuid.uuid4().hex[:12].upper()}"
+
+        return fulfill_order_payment_atomic(
+            db=session,
             order=order,
-            items=items,
-            reservations=reservations,
+            items=None,
+            reservations=None,
             txn_id=txn_id,
             amount=payment_data.amount,
             payment_mode=payment_data.payment_mode,
             idempotency_key=clean_idempotency_key,
             user_id=user.id
         )
+
+    try:
+        financial_entry = run_in_transaction_with_retry(db, _settle_payment_tx)
         return FinancialLedgerResponse.model_validate(financial_entry, from_attributes=True)
+    except HTTPException:
+        raise
+    except ReservationExpiredError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=e.message
+        )
+    except InsufficientStockError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=e.message
+        )
+    except ConcurrencyDeadlockError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=e.message,
+            headers={"Retry-After": str(e.retry_after)}
+        )
     except DATABASEINTEGRITYERROR as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e)
         )
-    except DATABASEOPERATIONALERROR as e:
+    except (DATABASEOPERATIONALERROR, OperationalError) as e:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(e)
@@ -253,34 +273,45 @@ def order_process_payment(
 
 
 def order_release_reservation(order_id: int, db: Session) -> OrderResponse:
-    order = select_order_by_id(db, order_id)
-    if not order:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Order with ID {order_id} not found"
-        )
+    def _release_tx(session: Session) -> Order:
+        order = select_order_by_id_for_update(session, order_id)
+        if not order:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Order with ID {order_id} not found"
+            )
 
-    if order.payment_status == 'PAID':
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot release reservations for an already paid order"
-        )
+        if order.payment_status == 'PAID':
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot release reservations for an already paid order"
+            )
 
-    if order.order_status == 'CANCELLED':
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Order is already cancelled"
-        )
+        if order.order_status == 'CANCELLED':
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Order is already cancelled"
+            )
+
+        return release_order_reservations(session, order)
 
     try:
-        released_order = release_order_reservations(db, order)
+        released_order = run_in_transaction_with_retry(db, _release_tx)
         return _build_order_response(db, released_order)
+    except HTTPException:
+        raise
+    except ConcurrencyDeadlockError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=e.message,
+            headers={"Retry-After": str(e.retry_after)}
+        )
     except DATABASEINTEGRITYERROR as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e)
         )
-    except DATABASEOPERATIONALERROR as e:
+    except (DATABASEOPERATIONALERROR, OperationalError) as e:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(e)

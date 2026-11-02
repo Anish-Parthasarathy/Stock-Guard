@@ -26,7 +26,14 @@ from app.repository.supplier import select_supplier_by_id
 from app.repository.product import select_product_by_id
 from app.repository.stock import select_warehouse_by_id, select_user_by_email
 from app.modules.module import PurchaseOrderApprovalStatus, PurchaseOrderStatus
-from app.repository.exceptions import DATABASEINTEGRITYERROR, INTERNALDATABASEERROR, DATABASEOPERATIONALERROR
+from app.core.database import run_in_transaction_with_retry
+from sqlalchemy.exc import OperationalError
+from app.repository.exceptions import (
+    DATABASEINTEGRITYERROR,
+    INTERNALDATABASEERROR,
+    DATABASEOPERATIONALERROR,
+    ConcurrencyDeadlockError,
+)
 
 
 def _build_po_response(db: Session, po) -> PurchaseOrderResponse:
@@ -317,21 +324,30 @@ def purchase_order_receive_item(
         )
 
     try:
-        receipt, _ = receive_po_item_atomic(
-            db=db,
-            po=po,
-            item=item,
-            quantity_received=receipt_data.quantity_received,
-            condition_notes=receipt_data.condition_notes,
-            user_id=user.id
+        receipt, _ = run_in_transaction_with_retry(
+            db,
+            lambda s: receive_po_item_atomic(
+                db=s,
+                po=po,
+                item=item,
+                quantity_received=receipt_data.quantity_received,
+                condition_notes=receipt_data.condition_notes,
+                user_id=user.id
+            )
         )
         return PurchaseOrderReceiptResponse.model_validate(receipt, from_attributes=True)
+    except ConcurrencyDeadlockError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=e.message,
+            headers={"Retry-After": str(e.retry_after)}
+        )
     except DATABASEINTEGRITYERROR as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e)
         )
-    except DATABASEOPERATIONALERROR as e:
+    except (DATABASEOPERATIONALERROR, OperationalError) as e:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(e)

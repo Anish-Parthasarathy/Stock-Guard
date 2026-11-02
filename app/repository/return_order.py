@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional, List, Tuple
 from sqlalchemy import select, func
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError, OperationalError
 from app.schemas.schema import ReturnCreate, ReturnReceiptCreate
@@ -184,29 +185,32 @@ def receive_return_item_atomic(
 
         # If restocked into warehouse inventory
         if receipt_data.status.upper() == 'RESTOCKED' or receipt_data.condition_status.upper() == 'GOOD':
-            stock_stmt = select(Stock).where(
-                Stock.warehouse_id == item.warehouse_id,
-                Stock.product_id == item.product_id
-            )
-            stock = db.scalar(stock_stmt)
-            if stock:
-                stock.quantity += receipt_data.quantity_received
-                stock.version = (stock.version or 1) + 1
-                stock.updated_at = now_utc
-            else:
-                stock = Stock(
+            upsert_stmt = (
+                pg_insert(Stock)
+                .values(
                     warehouse_id=item.warehouse_id,
                     product_id=item.product_id,
                     quantity=receipt_data.quantity_received,
                     version=1,
-                    updated_at=now_utc,
+                    updated_at=func.now(),
                     reorder_threshold=0
                 )
-                db.add(stock)
+                .on_conflict_do_update(
+                    constraint="uq_stock_warehouse_product",
+                    set_={
+                        "quantity": Stock.quantity + receipt_data.quantity_received,
+                        "version": Stock.version + 1,
+                        "updated_at": func.now()
+                    }
+                )
+                .returning(Stock)
+            )
+            res = db.execute(upsert_stmt, execution_options={"populate_existing": True})
+            stock = res.scalar_one()
 
             ledger = StockLedger(
-                warehouse_id=item.warehouse_id,
-                product_id=item.product_id,
+                warehouse_id=stock.warehouse_id,
+                product_id=stock.product_id,
                 user_id=user_id,
                 change_quantity=receipt_data.quantity_received,
                 reference_type=ReferenceType.RETURN,

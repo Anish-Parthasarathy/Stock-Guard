@@ -13,7 +13,13 @@ from app.repository.stock import (
     select_stock_ledgers
 )
 from app.modules.module import TransactionType
-from app.repository.exceptions import DATABASEINTEGRITYERROR, INTERNALDATABASEERROR, DATABASEOPERATIONALERROR
+from app.repository.exceptions import (
+    DATABASEINTEGRITYERROR,
+    INTERNALDATABASEERROR,
+    DATABASEOPERATIONALERROR,
+    OptimisticLockConflictError,
+    InsufficientStockError,
+)
 
 
 def _resolve_user_id(db: Session, email: Optional[str]) -> Optional[int]:
@@ -139,7 +145,18 @@ def stock_adjust(adj_data: StockAdjustmentCreate, db: Session, user_email: Optio
 
     # Resolve and validate adjustment type
     adj_type = adj_data.adjustment_type
-    if adj_type == TransactionType.ADJUSTMENT_DOWN.value or adj_type == TransactionType.ADJUSTMENT_DOWN:
+    is_absolute = False
+
+    if adj_type.upper() == "ABSOLUTE":
+        if adj_data.expected_version is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="expected_version is required for absolute value adjustments"
+            )
+        is_absolute = True
+        new_quantity = adj_data.quantity
+        tx_type = TransactionType.ADJUSTMENT_UP if adj_data.quantity >= current_stock.quantity else TransactionType.ADJUSTMENT_DOWN
+    elif adj_type == TransactionType.ADJUSTMENT_DOWN.value or adj_type == TransactionType.ADJUSTMENT_DOWN:
         if current_stock.quantity < adj_data.quantity:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -153,12 +170,10 @@ def stock_adjust(adj_data: StockAdjustmentCreate, db: Session, user_email: Optio
     else:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid adjustment_type '{adj_data.adjustment_type}'. Must be ADJUSTMENT_UP or ADJUSTMENT_DOWN"
+            detail=f"Invalid adjustment_type '{adj_data.adjustment_type}'. Must be ADJUSTMENT_UP, ADJUSTMENT_DOWN, or ABSOLUTE"
         )
 
     try:
-        # Pass the already-fetched stock object to avoid a second DB read
-        # and the race condition between the check above and the write below.
         return adjust_stock(
             db=db,
             stock=current_stock,
@@ -166,7 +181,19 @@ def stock_adjust(adj_data: StockAdjustmentCreate, db: Session, user_email: Optio
             new_quantity=new_quantity,
             change_quantity=adj_data.quantity,
             user_id=user_id,
-            notes=adj_data.notes
+            notes=adj_data.notes,
+            expected_version=adj_data.expected_version,
+            is_absolute=is_absolute
+        )
+    except OptimisticLockConflictError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=e.message
+        )
+    except InsufficientStockError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=e.message
         )
     except DATABASEINTEGRITYERROR as e:
         raise HTTPException(

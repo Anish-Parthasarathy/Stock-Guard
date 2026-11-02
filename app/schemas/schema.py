@@ -22,6 +22,31 @@ class sign_up(BaseModel):
     username: str = Field(..., max_length = 50)
     password: str = Field(..., max_length = 20)
 
+# --- User Management Schemas ---
+
+class UserCreate(BaseModel):
+    name: str = Field(..., min_length=2, max_length=100)
+    email: str = Field(..., max_length=200)
+    password: str = Field(..., min_length=8, max_length=100, description="Initial temporary password")
+    role: str = Field(..., description="Role such as admin, manager, warehouse_staff, delivery_agent")
+    warehouse_id: Optional[int] = Field(None, gt=0)
+
+class UserResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    name: str
+    email: str
+    role: str
+    warehouse_id: Optional[int] = None
+    created_at: datetime
+
+class PasswordChangeRequest(BaseModel):
+    old_password: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=8, max_length=100)
+
+class AdminResetPasswordRequest(BaseModel):
+    new_password: str = Field(..., min_length=8, max_length=100)
+
 class WarehouseCreate(BaseModel):
     name: str = Field(..., max_length=200)
     location: str = Field(..., max_length=500)
